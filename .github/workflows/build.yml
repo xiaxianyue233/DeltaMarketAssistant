@@ -1,0 +1,46 @@
+name: Windows build and regression tests
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify release tag matches application version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          [xml]$project = Get-Content .\src\DeltaMarketAssistant\DeltaMarketAssistant.csproj
+          $expected = 'v' + [string]$project.Project.PropertyGroup.Version
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match application version $expected"
+          }
+
+      - name: Build, test and publish
+        shell: pwsh
+        run: .\tools\Build.ps1 -Publish
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeltaMarketAssistant-win-x64-${{ github.ref_name }}
+          path: artifacts/publish/win-x64/**/DeltaMarketAssistant.exe
+          if-no-files-found: error
+          retention-days: 14
