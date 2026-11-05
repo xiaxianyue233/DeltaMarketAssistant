@@ -23,6 +23,8 @@
 
 `.github/workflows/build.yml` 在 main 推送、PR 和版本标签上运行 Windows 构建、21 项可移植回归及单文件发布。标签构建同时检查标签名与 csproj 版本一致。构建产物作为 Actions artifact 保留 14 天，不提交到 Git。
 
+需要将 EXE 补充到已有 Release 时，手动运行 `release-executable.yml`，填写发布标签、成功构建的 run ID 和 artifact 名称。工作流核对构建来自本仓库的 `build.yml`、测试成功且源码提交与标签完全一致，再直接上传 EXE 和独立 SHA-256 校验文件。已上传且内容不同的文件不会被覆盖；中断上传的残留项允许重试。此流程不移动版本标签，也不打包本机配置。
+
 ## 源码打包与恢复
 
 ```powershell

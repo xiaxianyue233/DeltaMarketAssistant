@@ -1,0 +1,121 @@
+name: Publish verified Windows executable
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        default: v1.20.0
+      run_id:
+        description: Successful Windows build run ID for that tag's commit
+        required: true
+      artifact_name:
+        description: Windows executable artifact name
+        required: true
+        default: DeltaMarketAssistant-win-x64-main
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-executable-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - name: Verify build provenance
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          BUILD_RUN_ID: ${{ inputs.run_id }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.RELEASE_TAG;
+            if (!/^v\d+\.\d+\.\d+$/.test(tag)) throw new Error('Invalid release tag');
+            if (!/^\d+$/.test(process.env.BUILD_RUN_ID)) throw new Error('Invalid build run ID');
+            const { data: run } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: Number(process.env.BUILD_RUN_ID)
+            });
+            if (run.conclusion !== 'success' || run.event === 'pull_request' ||
+                run.head_repository?.full_name !== `${owner}/${repo}` ||
+                run.path !== '.github/workflows/build.yml') {
+              throw new Error('Expected a successful trusted Windows build');
+            }
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            let object = ref.object;
+            while (object.type === 'tag') {
+              const { data } = await github.rest.git.getTag({ owner, repo, tag_sha: object.sha });
+              object = data.object;
+            }
+            if (object.type !== 'commit' || object.sha !== run.head_sha) {
+              throw new Error('Build source does not match the immutable release tag');
+            }
+            await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            core.info(`Verified source commit: ${run.head_sha}`);
+
+      - name: Download verified build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+          path: executable
+
+      - name: Upload executable and checksum
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            function findExecutables(directory) {
+              return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {
+                const file = path.join(directory, entry.name);
+                return entry.isDirectory() ? findExecutables(file) :
+                  entry.name === 'DeltaMarketAssistant.exe' ? [file] : [];
+              });
+            }
+            const files = findExecutables('executable');
+            if (files.length !== 1) throw new Error('Expected exactly one executable');
+            const data = fs.readFileSync(files[0]);
+            if (data[0] !== 0x4d || data[1] !== 0x5a) throw new Error('Invalid executable header');
+            const { owner, repo } = context.repo;
+            const tag = process.env.RELEASE_TAG;
+            const name = `DeltaMarketAssistant-${tag}-win-x64.exe`;
+            const digest = crypto.createHash('sha256').update(data).digest('hex');
+            const { data: release } = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            for (const asset of [
+              { name, data },
+              { name: `${name}.sha256`, data: Buffer.from(`${digest}  ${name}\n`, 'ascii') }
+            ]) {
+              const expected = `sha256:${crypto.createHash('sha256').update(asset.data).digest('hex')}`;
+              const existing = release.assets.find(item => item.name === asset.name);
+              if (existing?.state === 'uploaded') {
+                if (existing.size !== asset.data.length || existing.digest !== expected) {
+                  throw new Error(`Existing published asset differs: ${asset.name}`);
+                }
+                core.info(`Verified existing asset: ${asset.name}`);
+                continue;
+              }
+              if (existing) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: existing.id });
+              }
+              const { data: uploaded } = await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name: asset.name, data: asset.data,
+                headers: { 'content-type': 'application/octet-stream', 'content-length': asset.data.length }
+              });
+              if (uploaded.size !== asset.data.length || uploaded.digest !== expected) {
+                throw new Error(`Uploaded asset verification failed: ${asset.name}`);
+              }
+              core.info(`${asset.name}: ${expected}`);
+            }
+            await core.summary.addHeading(`Windows executable: ${tag}`)
+              .addLink('Release downloads', release.html_url)
+              .addRaw(`\n\nSHA-256: ${digest}\n`).write();
